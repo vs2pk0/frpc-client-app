@@ -464,7 +464,7 @@ textarea {
 
 .two-column {
   display: grid;
-  grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 24px;
   margin-bottom: 24px;
 }

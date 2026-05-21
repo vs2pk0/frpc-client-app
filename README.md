@@ -29,6 +29,6 @@ npm run tauri -- build
 仓库包含 `.github/workflows/release.yml`。推送 `v*` 标签后会自动在 GitHub Actions 中分别构建 macOS 和 Windows 安装包，并发布到 Releases。
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
