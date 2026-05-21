@@ -1,0 +1,21 @@
+.DS_Store
+*.log
+
+# Local environment and private FRP configs
+.env
+.env.*
+/frpc.toml
+/frps.toml
+/start.sh
+
+# Frontend dependencies and build output
+/node_modules/
+/dist/
+
+# Tauri/Rust build output
+/src-tauri/target/
+
+# Local FRP binaries; bundled resources live under src-tauri/resources.
+/frpc
+/frps
+

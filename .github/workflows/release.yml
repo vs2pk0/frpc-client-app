@@ -1,0 +1,120 @@
+name: Build Desktop Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag, for example v0.1.0"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS
+            os: macos-latest
+            artifact_name: macos-package
+          - label: Windows
+            os: windows-latest
+            artifact_name: windows-package
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri package
+        run: npm run tauri -- build
+
+      - name: Collect macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp src-tauri/target/release/bundle/dmg/*.dmg release-assets/
+
+      - name: Collect Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Get-ChildItem "src-tauri/target/release/bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Copy-Item -Destination release-assets
+          Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Copy-Item -Destination release-assets
+          if (-not (Get-ChildItem release-assets)) {
+            throw "No Windows package artifacts were produced."
+          }
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            prerelease="false"
+          elif [[ -n "${RELEASE_TAG_INPUT}" ]]; then
+            tag="${RELEASE_TAG_INPUT}"
+            prerelease="true"
+          else
+            tag="manual-${GITHUB_RUN_NUMBER}"
+            prerelease="true"
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: FRPC Tunnel Manager ${{ steps.release.outputs.tag }}
+          prerelease: ${{ steps.release.outputs.prerelease }}
+          files: release-assets/*
+
