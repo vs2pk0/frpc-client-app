@@ -77,6 +77,7 @@ type PathInfo = {
 
 type DashboardState = {
   paths: PathInfo;
+  current_platform: string;
   config_text: string;
   config_summary: ConfigSummary;
   runtimes: RuntimeInfo[];
@@ -165,15 +166,16 @@ function App() {
   }, [dashboard?.service.running]);
 
   const selectedAsset = useMemo(() => {
-    if (!release || !dashboard?.current_runtime) {
+    if (!release || !dashboard) {
       return null;
     }
+    const preferredPlatform = dashboard.current_platform || dashboard.current_runtime?.platform;
     return (
-      release.assets.find((asset) => asset.platform === dashboard.current_runtime?.platform) ??
+      release.assets.find((asset) => asset.platform === preferredPlatform) ??
       release.assets[0] ??
       null
     );
-  }, [dashboard?.current_runtime, release]);
+  }, [dashboard, release]);
 
   const runAction = async (label: string, action: () => Promise<void>) => {
     setBusy(label);
@@ -353,7 +355,7 @@ function App() {
         <MetricCard
           label="当前版本"
           value={dashboard.current_runtime?.version ?? "未安装"}
-          detail={dashboard.current_runtime?.platform ?? "等待导入"}
+          detail={dashboard.current_runtime?.platform ?? `当前平台 ${dashboard.current_platform}`}
         />
         <MetricCard
           label="服务状态"
@@ -439,7 +441,11 @@ function App() {
             </span>
           </div>
           <div className="service-actions">
-            <button className="primary" onClick={startService} disabled={Boolean(busy) || dashboard.service.running}>
+            <button
+              className="primary"
+              onClick={startService}
+              disabled={Boolean(busy) || dashboard.service.running || !dashboard.current_runtime}
+            >
               <Play size={19} />
               启动
             </button>

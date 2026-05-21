@@ -100,6 +100,7 @@ struct ServiceStatus {
 #[derive(Debug, Clone, Serialize)]
 struct DashboardState {
     paths: PathInfo,
+    current_platform: String,
     config_text: String,
     config_summary: ConfigSummary,
     runtimes: Vec<RuntimeInfo>,
@@ -259,6 +260,7 @@ async fn get_dashboard_state(
 
     Ok(DashboardState {
         paths: path_info(&app, current_runtime.as_ref())?,
+        current_platform: current_platform(),
         config_text,
         config_summary,
         runtimes,
@@ -326,14 +328,22 @@ async fn start_frpc(
     }
 
     let config = config_path(&app)?;
-    let mut child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("-c")
         .arg(&config)
         .current_dir(workspace_dir(&app)?)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("启动 frpc 失败")?;
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn().context("启动 frpc 失败")?;
 
     state.logs.lock().await.clear();
 
@@ -1102,6 +1112,18 @@ mod tests {
         let summary = parse_config_summary(&config_text);
         assert_eq!(summary.server_addr, "203.0.113.10");
         assert_eq!(summary.proxies[0].name, "pet-h5");
+    }
+
+    #[test]
+    fn release_asset_names_are_mapped_to_supported_platforms() {
+        assert_eq!(
+            platform_from_asset_name("frp_0.67.0_windows_amd64.zip"),
+            Some("windows-x64".to_string())
+        );
+        assert_eq!(
+            platform_from_asset_name("frp_0.67.0_darwin_arm64.tar.gz"),
+            Some("darwin-arm64".to_string())
+        );
     }
 
     #[cfg(unix)]

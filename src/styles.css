@@ -469,6 +469,11 @@ textarea {
   margin-bottom: 24px;
 }
 
+.two-column > .panel {
+  min-width: 0;
+  overflow: hidden;
+}
+
 .pill {
   display: inline-flex;
   min-height: 34px;
@@ -501,17 +506,29 @@ textarea {
 .proxy-list {
   display: grid;
   gap: 10px;
+  min-width: 0;
 }
 
 .proxy-row {
   display: grid;
-  grid-template-columns: minmax(120px, 0.9fr) 68px minmax(210px, 1fr) minmax(260px, 1.35fr);
+  grid-template-columns: minmax(72px, 0.8fr) 52px minmax(132px, 1fr) minmax(118px, 1fr);
   align-items: center;
   gap: 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-soft);
   padding: 13px 14px;
+}
+
+.proxy-row > * {
+  min-width: 0;
+}
+
+.proxy-row strong,
+.proxy-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .proxy-row span,
@@ -523,6 +540,7 @@ textarea {
 code {
   color: #27323b;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  min-width: 0;
   word-break: break-all;
 }
 
@@ -541,8 +559,10 @@ code {
   font-size: clamp(11px, 0.82vw, 13px);
   font-weight: 740;
   line-height: 1.25;
+  overflow: hidden;
   padding: 9px 11px;
   text-align: left;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
