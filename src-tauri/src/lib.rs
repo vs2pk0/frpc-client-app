@@ -4,13 +4,18 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    future::Future,
     io::{Cursor, Read},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tar::Archive;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -49,6 +54,8 @@ type AppResult<T> = Result<T, AppError>;
 struct ProcessState {
     child: Mutex<Option<Child>>,
     logs: Mutex<Vec<String>>,
+    close_prompt_open: AtomicBool,
+    shutdown_requested: AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,11 +196,13 @@ struct RuntimeCandidate {
 }
 
 pub fn run() {
+    let process_state = Arc::new(ProcessState::default());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(Arc::new(ProcessState::default()))
+        .manage(Arc::clone(&process_state))
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             reload_config,
@@ -210,6 +219,62 @@ pub fn run() {
             check_latest_release,
             open_path
         ])
+        .on_window_event({
+            let process_state = Arc::clone(&process_state);
+            move |window, event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+
+                    if process_state.shutdown_requested.load(Ordering::SeqCst)
+                        || process_state.close_prompt_open.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
+
+                    let app = window.app_handle().clone();
+                    let process_state = Arc::clone(&process_state);
+                    window
+                        .dialog()
+                        .message("确定要退出 FRPC Tunnel Manager 吗？\n退出前会停止所有正在运行的 frpc 服务。")
+                        .title("退出确认")
+                        .kind(MessageDialogKind::Warning)
+                        .buttons(MessageDialogButtons::OkCancelCustom(
+                            "确定".to_string(),
+                            "取消".to_string(),
+                        ))
+                        .show(move |confirmed| {
+                            let app = app.clone();
+                            let process_state = Arc::clone(&process_state);
+                            tauri::async_runtime::spawn(async move {
+                                process_state.close_prompt_open.store(false, Ordering::SeqCst);
+                                let app_for_cleanup = app.clone();
+                                let process_state_for_cleanup = Arc::clone(&process_state);
+                                if let Err(error) =
+                                    confirm_shutdown_and_exit(
+                                        Arc::clone(&process_state),
+                                        confirmed,
+                                        move || async move {
+                                            terminate_all_services(
+                                                &app_for_cleanup,
+                                                &process_state_for_cleanup,
+                                            )
+                                            .await
+                                        },
+                                        move || app.exit(0),
+                                    )
+                                    .await
+                                {
+                                    process_state
+                                        .shutdown_requested
+                                        .store(false, Ordering::SeqCst);
+                                    append_log(&process_state, format!("退出前停止服务失败：{error}"))
+                                        .await;
+                                }
+                            });
+                        });
+                }
+            }
+        })
         .setup(|app| {
             #[cfg(target_os = "macos")]
             apply_macos_app_icon().map_err(|error| error.to_string())?;
@@ -278,8 +343,7 @@ async fn reload_config(app: AppHandle) -> AppResult<String> {
 #[tauri::command]
 async fn save_config(app: AppHandle, request: SaveConfigRequest) -> AppResult<ConfigSummary> {
     validate_config_text(&request.config_text)?;
-    fs::write(config_path(&app)?, request.config_text.as_bytes())
-        .context("写入 frpc.toml 失败")?;
+    fs::write(config_path(&app)?, request.config_text.as_bytes()).context("写入 frpc.toml 失败")?;
     Ok(parse_config_summary(&request.config_text))
 }
 
@@ -366,8 +430,11 @@ async fn start_frpc(
 }
 
 #[tauri::command]
-async fn stop_frpc(state: State<'_, Arc<ProcessState>>) -> AppResult<ServiceStatus> {
-    terminate_child(&state).await?;
+async fn stop_frpc(
+    app: AppHandle,
+    state: State<'_, Arc<ProcessState>>,
+) -> AppResult<ServiceStatus> {
+    terminate_all_services(&app, state.inner()).await?;
     Ok(service_status(&state).await)
 }
 
@@ -377,7 +444,10 @@ async fn get_service_status(state: State<'_, Arc<ProcessState>>) -> AppResult<Se
 }
 
 #[tauri::command]
-async fn import_runtime(app: AppHandle, request: ImportRuntimeRequest) -> AppResult<Vec<RuntimeInfo>> {
+async fn import_runtime(
+    app: AppHandle,
+    request: ImportRuntimeRequest,
+) -> AppResult<Vec<RuntimeInfo>> {
     let archive_path = PathBuf::from(&request.archive_path);
     let candidate = extract_runtime_candidate(&archive_path)?;
     install_runtime(&app, candidate)?;
@@ -534,6 +604,108 @@ async fn terminate_child(state: &Arc<ProcessState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn terminate_all_services(app: &AppHandle, state: &Arc<ProcessState>) -> anyhow::Result<()> {
+    terminate_child(state).await?;
+    terminate_managed_frpc_processes(app, state).await
+}
+
+#[cfg(target_os = "windows")]
+async fn terminate_managed_frpc_processes(
+    app: &AppHandle,
+    state: &Arc<ProcessState>,
+) -> anyhow::Result<()> {
+    let script = windows_frpc_cleanup_script(&app_data_dir(app)?);
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command.output().await.context("清理残留 frpc.exe 失败")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !stdout.is_empty() {
+        append_log(state, stdout).await;
+    }
+    if !stderr.is_empty() {
+        append_log(state, stderr.clone()).await;
+    }
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("清理残留 frpc.exe 失败：{stderr}"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn terminate_managed_frpc_processes(
+    _app: &AppHandle,
+    _state: &Arc<ProcessState>,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn normalize_windows_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_frpc_cleanup_script(app_data_dir: &Path) -> String {
+    let app_data_dir = powershell_single_quoted(&normalize_windows_path(app_data_dir));
+    format!(
+        r#"$root = {app_data_dir}
+Get-CimInstance Win32_Process -Filter "Name = 'frpc.exe'" | Where-Object {{
+  if (-not $_.ExecutablePath) {{ $false }} else {{
+    $path = ($_.ExecutablePath -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    $path.EndsWith('/frpc.exe') -and $path.StartsWith($root + '/')
+  }}
+}} | ForEach-Object {{
+  Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+  Write-Output ("已停止残留 frpc.exe，PID " + $_.ProcessId)
+}}"#
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn confirm_shutdown_and_exit<C, Fut, F>(
+    state: Arc<ProcessState>,
+    confirmed: bool,
+    cleanup: C,
+    exit: F,
+) -> anyhow::Result<bool>
+where
+    C: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+    F: FnOnce() + Send + 'static,
+{
+    if !confirmed {
+        return Ok(false);
+    }
+
+    state.shutdown_requested.store(true, Ordering::SeqCst);
+    cleanup().await?;
+    exit();
+    Ok(true)
+}
+
 async fn service_status(state: &Arc<ProcessState>) -> ServiceStatus {
     let mut exit_log = None;
     let (running, pid) = {
@@ -562,11 +734,7 @@ async fn service_status(state: &Arc<ProcessState>) -> ServiceStatus {
     }
 
     let logs = state.logs.lock().await.clone();
-    ServiceStatus {
-        running,
-        pid,
-        logs,
-    }
+    ServiceStatus { running, pid, logs }
 }
 
 fn ensure_workspace(app: &AppHandle) -> anyhow::Result<()> {
@@ -575,7 +743,8 @@ fn ensure_workspace(app: &AppHandle) -> anyhow::Result<()> {
 
     let config = config_path(app)?;
     if !config.exists() {
-        fs::write(&config, default_config_text(app)?.as_bytes()).context("初始化 frpc.toml 失败")?;
+        fs::write(&config, default_config_text(app)?.as_bytes())
+            .context("初始化 frpc.toml 失败")?;
     }
 
     let settings = settings_path(app)?;
@@ -638,9 +807,7 @@ fn path_info(app: &AppHandle, runtime: Option<&RuntimeInfo>) -> anyhow::Result<P
 }
 
 fn app_data_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
-    app.path()
-        .app_data_dir()
-        .context("无法定位应用数据目录")
+    app.path().app_data_dir().context("无法定位应用数据目录")
 }
 
 fn workspace_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
@@ -702,7 +869,8 @@ fn parse_config_summary(config_text: &str) -> ConfigSummary {
 
     let server_addr = get_string(&value, &["serverAddr"]).unwrap_or_default();
     let server_port = get_integer(&value, &["serverPort"]).map(|port| port as u16);
-    let auth_method = get_string(&value, &["auth", "method"]).unwrap_or_else(|| "token".to_string());
+    let auth_method =
+        get_string(&value, &["auth", "method"]).unwrap_or_else(|| "token".to_string());
     let auth_token = get_string(&value, &["auth", "token"]).unwrap_or_default();
 
     let proxies = value
@@ -714,7 +882,8 @@ fn parse_config_summary(config_text: &str) -> ConfigSummary {
                 .map(|item| ProxySummary {
                     name: get_string(item, &["name"]).unwrap_or_default(),
                     proxy_type: get_string(item, &["type"]).unwrap_or_else(|| "tcp".to_string()),
-                    local_ip: get_string(item, &["localIP"]).unwrap_or_else(|| "127.0.0.1".to_string()),
+                    local_ip: get_string(item, &["localIP"])
+                        .unwrap_or_else(|| "127.0.0.1".to_string()),
                     local_port: get_integer(item, &["localPort"]).map(|port| port as u16),
                     remote_port: get_integer(item, &["remotePort"]).map(|port| port as u16),
                 })
@@ -809,10 +978,7 @@ fn current_runtime(app: &AppHandle) -> anyhow::Result<RuntimeInfo> {
     select_current_runtime(&runtimes, &settings).ok_or_else(|| anyhow!("没有可用的 frpc 运行时"))
 }
 
-fn select_current_runtime(
-    runtimes: &[RuntimeInfo],
-    settings: &AppSettings,
-) -> Option<RuntimeInfo> {
+fn select_current_runtime(runtimes: &[RuntimeInfo], settings: &AppSettings) -> Option<RuntimeInfo> {
     settings
         .current_runtime_id
         .as_ref()
@@ -832,7 +998,11 @@ fn list_runtimes(app: &AppHandle) -> anyhow::Result<Vec<RuntimeInfo>> {
 
     for entry in fs::read_dir(runtimes_path).context("读取运行时目录失败")? {
         let entry = entry.context("读取运行时条目失败")?;
-        if !entry.file_type().context("读取运行时文件类型失败")?.is_dir() {
+        if !entry
+            .file_type()
+            .context("读取运行时文件类型失败")?
+            .is_dir()
+        {
             continue;
         }
 
@@ -1081,7 +1251,11 @@ fn binary_name_for_platform(platform: &str) -> &'static str {
 #[allow(dead_code)]
 fn format_import_time(timestamp: &str) -> String {
     DateTime::parse_from_rfc3339(timestamp)
-        .map(|time| time.with_timezone(&Local).format("%Y/%m/%d %H:%M").to_string())
+        .map(|time| {
+            time.with_timezone(&Local)
+                .format("%Y/%m/%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|_| timestamp.to_string())
 }
 
@@ -1089,6 +1263,22 @@ fn format_import_time(timestamp: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn long_running_command() -> Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("ping");
+            command.arg("-n").arg("30").arg("127.0.0.1");
+            command
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
 
     #[test]
     fn quick_config_output_is_valid_toml_document() {
@@ -1126,12 +1316,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_cleanup_script_filters_to_app_data_frpc_executable() {
+        let app_data_dir =
+            Path::new(r"C:\Users\Owner O'Neil\AppData\Roaming\com.dalong.frpc.tunnel-manager");
+        let script = windows_frpc_cleanup_script(app_data_dir);
+
+        assert!(script
+            .contains("'c:/users/owner o''neil/appdata/roaming/com.dalong.frpc.tunnel-manager'"));
+        assert!(script.contains("Name = 'frpc.exe'"));
+        assert!(script.contains("$path.EndsWith('/frpc.exe')"));
+        assert!(script.contains("StartsWith($root + '/')"));
+        assert!(script.contains("Stop-Process"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn terminate_child_returns_stopped_status() {
         let state = Arc::new(ProcessState::default());
-        let child = Command::new("sleep")
-            .arg("30")
+        let child = long_running_command()
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1150,5 +1353,84 @@ mod tests {
 
         assert!(!status.running);
         assert_eq!(status.pid, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_keeps_service_running_and_does_not_exit() {
+        let state = Arc::new(ProcessState::default());
+        let cleaned_up = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let child = long_running_command()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test child should start");
+
+        *state.child.lock().await = Some(child);
+
+        let cleaned_up_for_closure = Arc::clone(&cleaned_up);
+        let exited_for_closure = Arc::clone(&exited);
+        let result = confirm_shutdown_and_exit(
+            Arc::clone(&state),
+            false,
+            move || async move {
+                cleaned_up_for_closure.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move || {
+                exited_for_closure.store(true, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("cancelled shutdown should not fail");
+
+        assert!(!result);
+        assert!(!cleaned_up.load(Ordering::SeqCst));
+        assert!(!exited.load(Ordering::SeqCst));
+        assert!(service_status(&state).await.running);
+
+        terminate_child(&state)
+            .await
+            .expect("test child should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn confirmed_shutdown_stops_service_before_exit() {
+        let state = Arc::new(ProcessState::default());
+        let exited_after_stop = Arc::new(AtomicBool::new(false));
+        let child = long_running_command()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test child should start");
+
+        *state.child.lock().await = Some(child);
+
+        let state_for_closure = Arc::clone(&state);
+        let exited_for_closure = Arc::clone(&exited_after_stop);
+        let state_for_cleanup = Arc::clone(&state);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            confirm_shutdown_and_exit(
+                Arc::clone(&state),
+                true,
+                move || async move { terminate_child(&state_for_cleanup).await },
+                move || {
+                    let is_stopped = state_for_closure
+                        .child
+                        .try_lock()
+                        .map(|child| child.is_none())
+                        .unwrap_or(false);
+                    exited_for_closure.store(is_stopped, Ordering::SeqCst);
+                },
+            ),
+        )
+        .await
+        .expect("confirmed shutdown should not hang")
+        .expect("confirmed shutdown should not fail");
+
+        assert!(result);
+        assert!(exited_after_stop.load(Ordering::SeqCst));
+        assert!(!service_status(&state).await.running);
     }
 }
