@@ -6,6 +6,7 @@ import {
   Check,
   CheckCircle2,
   CircleStop,
+  Clock3,
   CopyPlus,
   Download,
   ExternalLink,
@@ -108,6 +109,7 @@ type DashboardState = {
   runtimes: RuntimeInfo[];
   current_runtime: RuntimeInfo | null;
   service: ServiceStatus;
+  log_cleanup_interval_minutes: number;
   latest_release: ReleaseInfo | null;
 };
 
@@ -142,6 +144,16 @@ const defaultQuickConfig: QuickConfig = {
   auth_token: "",
   proxies: [defaultQuickProxy]
 };
+
+const logCleanupOptions = [
+  { value: 0, label: "不自动清空" },
+  { value: 15, label: "每 15 分钟" },
+  { value: 30, label: "每 30 分钟" },
+  { value: 60, label: "每 1 小时" },
+  { value: 360, label: "每 6 小时" },
+  { value: 720, label: "每 12 小时" },
+  { value: 1440, label: "每 24 小时" }
+] as const;
 
 function App() {
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
@@ -190,6 +202,9 @@ function App() {
   const hasRunningWorkspaces = Boolean(
     dashboard?.workspaces.some((workspace) => workspace.running_count > 0)
   );
+  const shouldPollService =
+    hasRunningWorkspaces ||
+    (tab === "logs" && (dashboard?.log_cleanup_interval_minutes ?? 0) > 0);
 
   const applyServiceStatus = useCallback((service: ServiceStatus, workspaceId: string) => {
     setDashboard((current) =>
@@ -207,7 +222,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!activeWorkspaceId || !hasRunningWorkspaces) {
+    if (!activeWorkspaceId || !shouldPollService) {
       return;
     }
     let cancelled = false;
@@ -230,7 +245,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeWorkspaceId, applyServiceStatus, hasRunningWorkspaces]);
+  }, [activeWorkspaceId, applyServiceStatus, shouldPollService]);
 
   const selectedAsset = useMemo(() => {
     if (!release || !dashboard) {
@@ -376,6 +391,35 @@ function App() {
       });
       applyServiceStatus(service, activeWorkspaceId);
       setNotice(`${proxyName || `#${proxyIndex + 1}`} 已重启`);
+    });
+
+  const clearWorkspaceLogs = () =>
+    runAction("清空日志中", async () => {
+      const service = await invoke<ServiceStatus>("clear_workspace_logs", {
+        request: { workspace_id: activeWorkspaceId }
+      });
+      applyServiceStatus(service, activeWorkspaceId);
+      setNotice(`${dashboard?.current_workspace.name ?? "当前工作区"} 的运行日志已清空`);
+    });
+
+  const setLogCleanupInterval = (intervalMinutes: number) =>
+    runAction("保存日志清理设置中", async () => {
+      const savedInterval = await invoke<number>("set_log_cleanup_interval", {
+        request: {
+          workspace_id: activeWorkspaceId,
+          interval_minutes: intervalMinutes
+        }
+      });
+      setDashboard((current) =>
+        current && current.current_workspace.id === activeWorkspaceId
+          ? { ...current, log_cleanup_interval_minutes: savedInterval }
+          : current
+      );
+      setNotice(
+        savedInterval === 0
+          ? "已关闭运行日志定时清空"
+          : `运行日志将${formatLogCleanupInterval(savedInterval)}自动清空`
+      );
     });
 
   const canLeaveWorkspace = () =>
@@ -748,7 +792,17 @@ function App() {
                 <h2>{tab === "quick" ? "服务器与代理配置" : tab === "editor" ? "原始 TOML" : "工作区日志"}</h2>
                 <p>{dashboard.paths.config_path}</p>
               </div>
-              {configDirty && tab !== "logs" && <span className="dirty-indicator">有未保存修改</span>}
+              {tab === "logs" ? (
+                <LogToolbar
+                  intervalMinutes={dashboard.log_cleanup_interval_minutes}
+                  hasLogs={dashboard.service.logs.length > 0}
+                  disabled={Boolean(busy)}
+                  onClear={clearWorkspaceLogs}
+                  onIntervalChange={setLogCleanupInterval}
+                />
+              ) : (
+                configDirty && <span className="dirty-indicator">有未保存修改</span>
+              )}
             </div>
 
             {tab === "quick" && (
@@ -1148,6 +1202,48 @@ function LogViewer({ logs }: { logs: string[] }) {
       {logs.length > 0 ? logs.join("\n") : "暂无运行日志。启动 frpc 后会在这里显示 stdout/stderr。"}
     </pre>
   );
+}
+
+function LogToolbar({
+  intervalMinutes,
+  hasLogs,
+  disabled,
+  onClear,
+  onIntervalChange
+}: {
+  intervalMinutes: number;
+  hasLogs: boolean;
+  disabled: boolean;
+  onClear: () => void;
+  onIntervalChange: (intervalMinutes: number) => void;
+}) {
+  return (
+    <div className="log-toolbar">
+      <label className="log-cleanup-control" title="设置当前工作区运行日志的自动清空周期">
+        <Clock3 size={16} />
+        <select
+          aria-label="定时清空日志"
+          value={intervalMinutes}
+          onChange={(event) => onIntervalChange(Number(event.target.value))}
+          disabled={disabled}
+        >
+          {logCleanupOptions.map((option) => (
+            <option value={option.value} key={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button className="ghost log-clear-button" onClick={onClear} disabled={disabled || !hasLogs}>
+        <Trash2 size={16} />
+        清空日志
+      </button>
+    </div>
+  );
+}
+
+function formatLogCleanupInterval(intervalMinutes: number) {
+  return logCleanupOptions.find((option) => option.value === intervalMinutes)?.label ?? "按设定周期";
 }
 
 function toQuickConfig(summary: ConfigSummary): QuickConfig {

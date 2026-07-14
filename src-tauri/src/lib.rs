@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 use tar::Archive;
 use tauri::{AppHandle, Manager, State, WindowEvent};
@@ -57,8 +58,14 @@ struct ProcessState {
     services: Mutex<BTreeMap<String, ManagedService>>,
     service_operation: Mutex<()>,
     logs: Mutex<BTreeMap<String, Vec<String>>>,
+    log_cleanup_policies: Mutex<BTreeMap<String, LogCleanupPolicy>>,
     close_prompt_open: AtomicBool,
     shutdown_requested: AtomicBool,
+}
+
+struct LogCleanupPolicy {
+    interval_minutes: u64,
+    next_cleanup_at: Instant,
 }
 
 struct ManagedService {
@@ -140,6 +147,7 @@ struct DashboardState {
     runtimes: Vec<RuntimeInfo>,
     current_runtime: Option<RuntimeInfo>,
     service: ServiceStatus,
+    log_cleanup_interval_minutes: u64,
     latest_release: Option<ReleaseInfo>,
 }
 
@@ -147,6 +155,8 @@ struct DashboardState {
 struct AppSettings {
     current_runtime_id: Option<String>,
     current_workspace_id: Option<String>,
+    #[serde(default)]
+    log_cleanup_intervals: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +277,12 @@ struct RenameWorkspaceRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct LogCleanupRequest {
+    workspace_id: String,
+    interval_minutes: u64,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeCandidate {
     version: String,
@@ -298,6 +314,8 @@ pub fn run() {
             stop_proxy_service,
             restart_proxy_service,
             get_service_status,
+            clear_workspace_logs,
+            set_log_cleanup_interval,
             import_runtime,
             download_and_import_runtime,
             set_current_runtime,
@@ -417,11 +435,18 @@ async fn get_dashboard_state(
     let config_text = read_config_text(&app, &current_workspace.id)?;
     reconcile_services_for_config(state.inner(), &current_workspace.id, &config_text).await;
     let config_summary = parse_config_summary(&config_text);
+    let settings = read_settings(&app)?;
+    sync_log_cleanup_policies(state.inner(), &settings.log_cleanup_intervals).await;
     let service = service_status(&state, &current_workspace.id).await;
     let runtimes = list_runtimes_with_usage(&app, state.inner()).await?;
-    let settings = read_settings(&app)?;
     let current_runtime = select_current_runtime(&runtimes, &settings);
     let workspaces = workspace_infos(&registry, &service.workspace_running_counts);
+    let log_cleanup_interval_minutes = settings
+        .log_cleanup_intervals
+        .get(&current_workspace.id)
+        .copied()
+        .filter(|interval| is_valid_log_cleanup_interval(*interval))
+        .unwrap_or(0);
 
     Ok(DashboardState {
         workspaces,
@@ -433,6 +458,7 @@ async fn get_dashboard_state(
         runtimes,
         current_runtime,
         service,
+        log_cleanup_interval_minutes,
         latest_release: None,
     })
 }
@@ -445,7 +471,10 @@ async fn create_workspace(
 ) -> AppResult<WorkspaceRecord> {
     let _operation = state.service_operation.lock().await;
     ensure_workspaces(&app)?;
-    create_workspace_copy(&app, &request.source_workspace_id).map_err(AppError::from)
+    let workspace = create_workspace_copy(&app, &request.source_workspace_id)?;
+    let settings = read_settings(&app)?;
+    sync_log_cleanup_policies(state.inner(), &settings.log_cleanup_intervals).await;
+    Ok(workspace)
 }
 
 #[tauri::command]
@@ -489,11 +518,16 @@ async fn delete_workspace(
     };
 
     let mut next_settings = original_settings.clone();
-    let settings_changed =
+    let current_workspace_changed =
         next_settings.current_workspace_id.as_deref() == Some(&request.workspace_id);
-    if settings_changed {
+    if current_workspace_changed {
         next_settings.current_workspace_id = Some(next_workspace.id.clone());
     }
+    let cleanup_settings_changed = next_settings
+        .log_cleanup_intervals
+        .remove(&request.workspace_id)
+        .is_some();
+    let settings_changed = current_workspace_changed || cleanup_settings_changed;
 
     let commit_result = (|| -> anyhow::Result<()> {
         if settings_changed {
@@ -512,6 +546,11 @@ async fn delete_workspace(
     }
 
     state.logs.lock().await.remove(&request.workspace_id);
+    state
+        .log_cleanup_policies
+        .lock()
+        .await
+        .remove(&request.workspace_id);
     if let Some(staged) = staged_dir {
         if let Err(error) = fs::remove_dir_all(&staged) {
             append_log(
@@ -688,6 +727,48 @@ async fn get_service_status(
     request: RequiredWorkspaceRequest,
 ) -> AppResult<ServiceStatus> {
     Ok(service_status(&state, &request.workspace_id).await)
+}
+
+#[tauri::command]
+async fn clear_workspace_logs(
+    app: AppHandle,
+    state: State<'_, Arc<ProcessState>>,
+    request: RequiredWorkspaceRequest,
+) -> AppResult<ServiceStatus> {
+    let _operation = state.service_operation.lock().await;
+    ensure_workspace_exists(&app, &request.workspace_id)?;
+    clear_workspace_log_buffer(state.inner(), &request.workspace_id).await;
+    Ok(service_status(&state, &request.workspace_id).await)
+}
+
+#[tauri::command]
+async fn set_log_cleanup_interval(
+    app: AppHandle,
+    state: State<'_, Arc<ProcessState>>,
+    request: LogCleanupRequest,
+) -> AppResult<u64> {
+    if !is_valid_log_cleanup_interval(request.interval_minutes) {
+        return Err(anyhow!("不支持的日志定时清理周期").into());
+    }
+
+    let _operation = state.service_operation.lock().await;
+    ensure_workspace_exists(&app, &request.workspace_id)?;
+    let mut settings = read_settings(&app)?;
+    if request.interval_minutes == 0 {
+        settings.log_cleanup_intervals.remove(&request.workspace_id);
+    } else {
+        settings
+            .log_cleanup_intervals
+            .insert(request.workspace_id.clone(), request.interval_minutes);
+    }
+    write_settings(&app, &settings)?;
+    configure_log_cleanup_policy(
+        state.inner(),
+        &request.workspace_id,
+        request.interval_minutes,
+    )
+    .await;
+    Ok(request.interval_minutes)
 }
 
 #[tauri::command]
@@ -975,6 +1056,7 @@ where
 }
 
 async fn append_log(state: &Arc<ProcessState>, workspace_id: &str, line: impl Into<String>) {
+    clear_workspace_logs_if_due(state, workspace_id).await;
     let mut logs = state.logs.lock().await;
     let logs = logs.entry(workspace_id.to_string()).or_default();
     logs.push(line.into());
@@ -982,6 +1064,84 @@ async fn append_log(state: &Arc<ProcessState>, workspace_id: &str, line: impl In
     if overflow > 0 {
         logs.drain(0..overflow);
     }
+}
+
+fn is_valid_log_cleanup_interval(interval_minutes: u64) -> bool {
+    matches!(interval_minutes, 0 | 15 | 30 | 60 | 360 | 720 | 1440)
+}
+
+fn next_log_cleanup_at(interval_minutes: u64) -> Instant {
+    Instant::now() + Duration::from_secs(interval_minutes * 60)
+}
+
+async fn configure_log_cleanup_policy(
+    state: &Arc<ProcessState>,
+    workspace_id: &str,
+    interval_minutes: u64,
+) {
+    let mut policies = state.log_cleanup_policies.lock().await;
+    if interval_minutes == 0 {
+        policies.remove(workspace_id);
+        return;
+    }
+
+    match policies.get(workspace_id) {
+        Some(policy) if policy.interval_minutes == interval_minutes => {}
+        _ => {
+            policies.insert(
+                workspace_id.to_string(),
+                LogCleanupPolicy {
+                    interval_minutes,
+                    next_cleanup_at: next_log_cleanup_at(interval_minutes),
+                },
+            );
+        }
+    }
+}
+
+async fn sync_log_cleanup_policies(state: &Arc<ProcessState>, intervals: &BTreeMap<String, u64>) {
+    let mut policies = state.log_cleanup_policies.lock().await;
+    policies.retain(|workspace_id, policy| {
+        intervals.get(workspace_id).copied() == Some(policy.interval_minutes)
+            && is_valid_log_cleanup_interval(policy.interval_minutes)
+            && policy.interval_minutes > 0
+    });
+
+    for (workspace_id, interval_minutes) in intervals {
+        if *interval_minutes > 0
+            && is_valid_log_cleanup_interval(*interval_minutes)
+            && !policies.contains_key(workspace_id)
+        {
+            policies.insert(
+                workspace_id.clone(),
+                LogCleanupPolicy {
+                    interval_minutes: *interval_minutes,
+                    next_cleanup_at: next_log_cleanup_at(*interval_minutes),
+                },
+            );
+        }
+    }
+}
+
+async fn clear_workspace_logs_if_due(state: &Arc<ProcessState>, workspace_id: &str) {
+    let mut policies = state.log_cleanup_policies.lock().await;
+    let Some(policy) = policies.get_mut(workspace_id) else {
+        return;
+    };
+    if Instant::now() < policy.next_cleanup_at {
+        return;
+    }
+
+    policy.next_cleanup_at = next_log_cleanup_at(policy.interval_minutes);
+    state.logs.lock().await.remove(workspace_id);
+}
+
+async fn clear_workspace_log_buffer(state: &Arc<ProcessState>, workspace_id: &str) {
+    let mut policies = state.log_cleanup_policies.lock().await;
+    if let Some(policy) = policies.get_mut(workspace_id) {
+        policy.next_cleanup_at = next_log_cleanup_at(policy.interval_minutes);
+    }
+    state.logs.lock().await.remove(workspace_id);
 }
 
 async fn terminate_all_services(app: &AppHandle, state: &Arc<ProcessState>) -> anyhow::Result<()> {
@@ -1311,6 +1471,7 @@ async fn service_status(state: &Arc<ProcessState>, workspace_id: &str) -> Servic
         append_log(state, &log_workspace_id, line).await;
     }
 
+    clear_workspace_logs_if_due(state, workspace_id).await;
     let logs = state
         .logs
         .lock()
@@ -1472,6 +1633,15 @@ fn create_workspace_copy(
     registry.workspaces.push(workspace.clone());
     write_workspace_registry(app, &registry)?;
     let mut settings = read_settings(app)?;
+    if let Some(interval_minutes) = settings
+        .log_cleanup_intervals
+        .get(source_workspace_id)
+        .copied()
+    {
+        settings
+            .log_cleanup_intervals
+            .insert(workspace.id.clone(), interval_minutes);
+    }
     settings.current_workspace_id = Some(workspace.id.clone());
     write_settings(app, &settings)?;
     Ok(workspace)
@@ -2241,7 +2411,6 @@ fn format_import_time(timestamp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn long_running_command() -> Command {
         #[cfg(target_os = "windows")]
@@ -2453,6 +2622,65 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn log_cleanup_intervals_are_restricted_to_supported_options() {
+        for interval in [0, 15, 30, 60, 360, 720, 1440] {
+            assert!(is_valid_log_cleanup_interval(interval));
+        }
+        assert!(!is_valid_log_cleanup_interval(1));
+        assert!(!is_valid_log_cleanup_interval(1441));
+    }
+
+    #[test]
+    fn legacy_settings_default_to_disabled_log_cleanup() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"current_runtime_id":null,"current_workspace_id":"default"}"#)
+                .expect("legacy settings should remain readable");
+        assert!(settings.log_cleanup_intervals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_logs_can_be_cleared_manually_and_on_schedule() {
+        let state = Arc::new(ProcessState::default());
+        let workspace_id = "workspace-a";
+        let other_workspace_id = "workspace-b";
+        configure_log_cleanup_policy(&state, workspace_id, 15).await;
+        configure_log_cleanup_policy(&state, other_workspace_id, 30).await;
+        append_log(&state, workspace_id, "first").await;
+        append_log(&state, other_workspace_id, "other").await;
+
+        {
+            let mut policies = state.log_cleanup_policies.lock().await;
+            policies
+                .get_mut(workspace_id)
+                .expect("cleanup policy should exist")
+                .next_cleanup_at = Instant::now() - Duration::from_secs(1);
+        }
+        append_log(&state, workspace_id, "second").await;
+        assert_eq!(
+            state.logs.lock().await.get(workspace_id).cloned(),
+            Some(vec!["second".to_string()])
+        );
+        assert_eq!(
+            state.logs.lock().await.get(other_workspace_id).cloned(),
+            Some(vec!["other".to_string()])
+        );
+
+        clear_workspace_log_buffer(&state, workspace_id).await;
+        assert!(!state.logs.lock().await.contains_key(workspace_id));
+        assert!(state.logs.lock().await.contains_key(other_workspace_id));
+        assert!(
+            state
+                .log_cleanup_policies
+                .lock()
+                .await
+                .get(workspace_id)
+                .expect("cleanup policy should remain enabled")
+                .next_cleanup_at
+                > Instant::now()
+        );
     }
 
     #[test]

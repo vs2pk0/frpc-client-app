@@ -1308,6 +1308,47 @@ body {
   font-weight: 750;
 }
 
+.log-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-cleanup-control {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--muted);
+  padding: 0 7px 0 9px;
+}
+
+.log-cleanup-control:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(40, 123, 111, 0.1);
+}
+
+.log-cleanup-control select {
+  min-width: 112px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.log-clear-button {
+  min-height: 34px;
+  padding: 0 10px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .surface-panel .quick-editor {
   gap: 11px;
 }
